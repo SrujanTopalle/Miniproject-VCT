@@ -1,15 +1,10 @@
-import os
-from torch_scatter import scatter_mean
 import torch
 import torch.nn as nn
-import matplotlib.pyplot as plt
-import torchvision
 from torch.nn import init
 import torch.nn.functional as F
 from torch.optim import lr_scheduler
 import functools
 from einops import rearrange
-from utils import make_numpy_grid
 import models
 from models.help_funcs import Transformer, TransformerDecoder, TwoLayerConv2d, TransformerCross
 from models.gcnlayers import *
@@ -338,10 +333,18 @@ class Reliable_Transformer(ResNet):
         x = x + m
         return x
 
-    def kmeansToken(self, x, num_clusters):
-        cluster_ids_x, _ = kmeans(X=x.detach(), num_clusters=num_clusters, distance='euclidean')
-        c = scatter_mean(x, cluster_ids_x.squeeze(), dim=1, dim_size=num_clusters)
-        return c
+    def kmeansToken(self, tokens, num_clusters):
+        # tokens shape: (batch_size, num_points, channels)
+        choice_cluster, cluster_centers = kmeans(tokens, num_clusters)
+        # Aggregate tokens by cluster centers
+        batch_size, num_points, channels = tokens.shape
+        new_tokens = torch.zeros((batch_size, num_clusters, channels), device=tokens.device)
+        for b in range(batch_size):
+            for c in range(num_clusters):
+                mask = choice_cluster[b] == c
+                if mask.any():
+                    new_tokens[b, c] = tokens[b, mask].mean(dim=0)
+        return new_tokens 
 
     def knngraph(self, a):
         b, c, h, w = a.shape
@@ -356,50 +359,36 @@ class Reliable_Transformer(ResNet):
         return d
 
     def forward(self, x1, x2):
-        # forward backbone resnet
-        x1 = self.forward_single(x1)
-        x2 = self.forward_single(x2)
+        
+        x1 = self.forward_single(x1)  # x1 shape: (batch_size, channels, height, width)
+        x2 = self.forward_single(x2)  # x2 shape: (batch_size, channels, height, width)
         b, c, h, w = x1.shape
-        x3 = torch.abs(x1 - x2)  # b  c  h  w
-        x4 = x3.reshape(b, c, -1).transpose(1, 2)  # b  hw  c
-        A = self.knngraph(x3)  # b hw hw
+        x3 = torch.abs(x1 - x2)  # x3 shape: (batch_size, channels, height, width)
+        x4 = x3.reshape(b, c, -1).transpose(1, 2)  # x4 shape: (batch_size, height * width, channels)
+        A = self.knngraph(x3)  # A shape: (batch_size, height * width, height * width)
         A = normalize_adj(A)
-        F = self.gc1(x4, A)  # b hw 1
-        F = F.transpose(1, 2)
-        _, indices = F.topk(k=self.k, dim=2, largest=False)  # indices:(8,1,k)
+        F = self.gc1(x4, A)  # F shape: (batch_size, height * width, 1)
+        F = F.transpose(1, 2)  # F shape: (batch_size, 1, height * width)
+        _, indices = F.topk(k=self.k, dim=2, largest=False)  # indices shape: (batch_size, 1, k)
 
-        token1 = self._forward_tokens(x1, indices)
-        token2 = self._forward_tokens(x2, indices)  # (b,k,c)
+        token1 = self._forward_tokens(x1, indices)  # token1 shape: (batch_size, k, channels)
+        token2 = self._forward_tokens(x2, indices)  # token2 shape: (batch_size, k, channels)
 
-        token1 = self.kmeansToken(token1, self.cluster_nums)
-        token2 = self.kmeansToken(token2, self.cluster_nums)
-
+        token1 = self.kmeansToken(token1, self.cluster_nums)  # token1 shape: (batch_size, cluster_nums, channels)
+        token2 = self.kmeansToken(token2, self.cluster_nums)  # token2 shape: (batch_size, cluster_nums, channels)
 
         if self.token_trans:
-            self.tokens_ = torch.cat([token1, token2], dim=1)
-            self.tokens = self._forward_transformer(self.tokens_)
-            token1, token2 = self.tokens.chunk(2, dim=1)
-        # forward transformer decoder
+            self.tokens_ = torch.cat([token1, token2], dim=1)  # self.tokens_ shape: (batch_size, 2 * cluster_nums, channels)
+            self.tokens = self._forward_transformer(self.tokens_)  # self.tokens shape: (batch_size, 2 * cluster_nums, channels)
+            token1, token2 = self.tokens.chunk(2, dim=1)  # token1, token2 shapes: (batch_size, cluster_nums, channels)
 
-        token1_ = self.forwardCorss(token1, token2)
-        token2_ = self.forwardCorss(token2, token1)
-
-        x1 = self._forward_transformer_decoder(x1, token1_)
-        x2 = self._forward_transformer_decoder(x2, token2_)
-
-        # if self.with_decoder:
-        #     x1 = self._forward_transformer_decoder(x1, token1_)
-        #     x2 = self._forward_transformer_decoder(x2, token2_)
-        # else:
-        #     x1 = self._forward_simple_decoder(x1, token1)
-        #     x2 = self._forward_simple_decoder(x2, token2)
-        # feature differencing
-        x = torch.abs(x1 - x2)
-        # if not self.if_upsample_2x:
-        #     x = self.upsamplex2(x)
-        x = self.upsamplex4(x)
-        # forward small cnn
-        x = self.classifier(x)
+        token1_ = self.forwardCorss(token1, token2)  # token1_ shape: (batch_size, cluster_nums, channels)
+        token2_ = self.forwardCorss(token2, token1)  # token2_ shape: (batch_size, cluster_nums, channels)
+        x1 = self._forward_transformer_decoder(x1, token1_)  # x1 shape: (batch_size, channels, height, width)
+        x2 = self._forward_transformer_decoder(x2, token2_)  # x2 shape: (batch_size, channels, height, width)
+        x = torch.abs(x1 - x2)  # x shape: (batch_size, channels, height, width)
+        x = self.upsamplex4(x)  # x shape: (batch_size, channels, height*4, width*4)
+        x = self.classifier(x)  # x shape: (batch_size, output_channels, height*4, width*4)
         if self.output_sigmoid:
-            x = self.sigmoid(x)
+            x = self.sigmoid(x)  # x shape: (batch_size, output_channels, height*4, width*4)
         return x
